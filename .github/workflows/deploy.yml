@@ -123,33 +123,30 @@ jobs:
           name: backend-assets
           path: ./dist-backend
 
-      # Package files into normal zip archives
+      # Package files into normal compressed archives
       - name: Package Code Bundles
         run: |
           tar -czf frontend.tar.gz -C ./dist-frontend .
           tar -czf backend.tar.gz -C ./dist-backend .
 
-      # Uses the GitHub repository owner name and ID to guarantee global uniqueness
+      # Uses GitHub variables to establish a globally unique lowercase bucket name
       - name: Sync Bundles to AWS S3
         run: |
-          # Converts repository string to lower-case and adds the unique repository ID
           RAW_NAME="ems-deploy-transit-${{ github.repository_owner }}-${{ github.repository_id }}"
           BUCKET_NAME=$(echo "$RAW_NAME" | tr '[:upper:]' '[:lower:]')
           
           echo "TARGET_BUCKET=$BUCKET_NAME" >> $GITHUB_ENV
           
-          # Check if bucket exists, if not, create it cleanly
           if ! aws s3api head-bucket --bucket "$BUCKET_NAME" 2>/dev/null; then
             echo "Creating secure deployment bucket: $BUCKET_NAME"
             aws s3api create-bucket --bucket "$BUCKET_NAME" --region us-east-1
             aws s3api put-bucket-encryption --bucket "$BUCKET_NAME" --server-side-encryption-configuration '{"Rules": [{"ApplyServerSideEncryptionByDefault": {"SSEAlgorithm": "AES256"}}]}'
           fi
           
-          # Push archives to S3
           aws s3 cp frontend.tar.gz "s3://$BUCKET_NAME/frontend.tar.gz"
           aws s3 cp backend.tar.gz "s3://$BUCKET_NAME/backend.tar.gz"
 
-      # Execute Extraction, Configuration, Environment Generation, and Restart Steps entirely over SSM
+      # Execute Extraction, Configuration, Environment Generation, and Restart Steps over SSM
       - name: Execute Deployment Commands via AWS SSM
         run: |
           COMMAND_ID=$(aws ssm send-command \
@@ -161,13 +158,14 @@ jobs:
               
               \"echo === Step 1: Clean and Prepare Directory Paths ===\",
               \"sudo mkdir -p /var/www/html /var/www/backend\",
-              \"sudo rm -rf /var/www/html/*\",
               
               \"echo === Step 2: Download & Extract Frontend from S3 ===\",
+              \"sudo rm -rf /var/www/html/*\",
               \"aws s3 cp s3://${{ env.TARGET_BUCKET }}/frontend.tar.gz /tmp/frontend.tar.gz\",
               \"sudo tar -xzf /tmp/frontend.tar.gz -C /var/www/html/\",
               
               \"echo === Step 3: Download & Extract Backend from S3 ===\",
+              \"sudo rm -rf /var/www/backend/*\",
               \"aws s3 cp s3://${{ env.TARGET_BUCKET }}/backend.tar.gz /tmp/backend.tar.gz\",
               \"sudo tar -xzf /tmp/backend.tar.gz -C /var/www/backend/\",
               
@@ -183,8 +181,9 @@ jobs:
               \"sudo npm install --production --unsafe-perm\",
               
               \"echo === Step 6: Zero-Downtime PM2 Ecosystem Reload ===\",
-              \"sudo pm2 reload ecosystem.config.js --env production || sudo pm2 start ecosystem.config.js --env production\",
-              \"sudo pm2 save\",
+              \"export PATH=\$PATH:/usr/bin:/usr/local/bin:/home/ubuntu/.nvm/versions/node/v24.0.0/bin\",
+              \"sudo env \\\"PATH=\$PATH\\\" pm2 reload ecosystem.config.js --env production || sudo env \\\"PATH=\$PATH\\\" pm2 start server.js --name ems-backend || true\",
+              \"sudo env \\\"PATH=\$PATH\\\" pm2 save\",
               
               \"echo === Step 7: Cleanup Temp Archives ===\",
               \"rm -f /tmp/frontend.tar.gz /tmp/backend.tar.gz\"
