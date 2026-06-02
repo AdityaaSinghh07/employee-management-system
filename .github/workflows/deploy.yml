@@ -1,38 +1,46 @@
-name: Deploy Employee Management System
+name: Deploy to EC2 (OIDC)
 
 on:
   push:
     branches:
       - main
 
+permissions:
+  id-token: write
+  contents: read
+
 jobs:
-  build:
+  deploy:
     runs-on: ubuntu-latest
 
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout code
+        uses: actions/checkout@v4
 
-      # Frontend
-      - name: Build Frontend
-        run: |
-          cd frontend
-          npm ci
-          npm run build
-
-      # Backend
-      - name: Install Backend Dependencies
-        run: |
-          cd backend
-          npm ci
-
-      # AWS Login via OIDC
-      - name: Configure AWS Credentials
+      - name: Configure AWS credentials (OIDC)
         uses: aws-actions/configure-aws-credentials@v4
         with:
-          role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
+          role-to-assume: arn:aws:iam::<ACCOUNT_ID>:role/<OIDC_ROLE>
           aws-region: us-east-1
 
-      # Deploy using SSM
-      - name: Deploy
+      - name: Deploy via SSM
         run: |
-          aws ssm send-command ...
+          aws ssm send-command \
+            --document-name "AWS-RunShellScript" \
+            --targets "Key=instanceIds,Values=<EC2_INSTANCE_ID>" \
+            --parameters 'commands=[
+              "cd /home/ubuntu/employee-management-system",
+              "git pull origin main",
+
+              "cd backend",
+              "npm install",
+              "pm2 restart ecosystem.config.js || pm2 start ecosystem.config.js",
+
+              "cd ../frontend",
+              "npm install",
+              "npm run build",
+              "sudo rm -rf /var/www/frontend/*",
+              "sudo cp -r build/* /var/www/frontend/",
+
+              "sudo systemctl restart nginx"
+            ]'
