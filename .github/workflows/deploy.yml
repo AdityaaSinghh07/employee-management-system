@@ -3,14 +3,16 @@ name: Secure Employee Management System Deployment
 on:
   push:
     branches:
-      - main 
+      - main # Triggers when you push from your DevOps workstation to GitHub main branch
 
 permissions:
-  id-token: write 
-  contents: read  
+  id-token: write # Mandatory for requesting the dynamic AWS OIDC JWT token
+  contents: read  # Mandatory to checkout the codebase
 
 jobs:
-  
+  # =============================================================
+  # JOB 1: Parallel Frontend Dependency Scan & Vite Compile
+  # =============================================================
   build-frontend:
     runs-on: ubuntu-latest
     steps:
@@ -29,6 +31,7 @@ jobs:
           cd frontend
           npm ci
 
+      # Scans frontend dependencies before execution
       - name: Security Scan Frontend Code (Trivy)
         uses: aquasecurity/trivy-action@v0.36.0
         with:
@@ -39,6 +42,7 @@ jobs:
           ignore-unfixed: true # Prevents breaking on bugs without a public patch
           severity: 'HIGH,CRITICAL'
 
+      # Compiles into production static files only if scanning succeeds
       - name: Build Vite Production Bundles
         run: |
           cd frontend
@@ -50,7 +54,9 @@ jobs:
           name: frontend-assets
           path: frontend/dist/
 
-
+  # =============================================================
+  # JOB 2: Parallel Backend Dependency Scan & Staging
+  # =============================================================
   build-backend:
     runs-on: ubuntu-latest
     steps:
@@ -69,6 +75,7 @@ jobs:
           cd backend
           npm ci
 
+      # Scans backend Node modules for CVEs
       - name: Security Scan Backend Code (Trivy)
         uses: aquasecurity/trivy-action@v0.36.0
         with:
@@ -79,13 +86,16 @@ jobs:
           ignore-unfixed: true
           severity: 'HIGH,CRITICAL'
 
+      # Upload the backend folder as an artifact
       - name: Upload Backend Artifact
         uses: actions/upload-artifact@v4
         with:
           name: backend-assets
           path: backend/
 
-
+  # =============================================================
+  # JOB 3: Secure AWS Deployment via SSM
+  # =============================================================
   deploy:
     runs-on: ubuntu-latest
     needs: [build-frontend, build-backend] # Runs ONLY if frontend and backend pass scans
@@ -93,7 +103,7 @@ jobs:
       - name: Checkout Repository
         uses: actions/checkout@v4
 
-      # Step 4: Secure AWS OIDC Cryptographic Handshake
+      # Secure AWS OIDC Cryptographic Handshake
       - name: Configure AWS Credentials via OIDC
         uses: aws-actions/configure-aws-credentials@v4
         with:
@@ -114,55 +124,34 @@ jobs:
           name: backend-assets
           path: ./dist-backend
 
-      # Compress artifacts into standalone archives for fast network transit
-      - name: Compress Target Tarballs
-        run: |
-          tar -czf frontend.tar.gz -C ./dist-frontend .
-          tar -czf backend.tar.gz -C ./dist-backend .
-
-      # Copy archives safely to your internal S3 transit bucket
-      - name: Upload Tarballs to AWS S3 Transit Bucket
-        run: |
-          aws s3 cp frontend.tar.gz s3://${{ secrets.AWS_DEPLOY_BUCKET }}/frontend.tar.gz
-          aws s3 cp backend.tar.gz s3://${{ secrets.AWS_DEPLOY_BUCKET }}/backend.tar.gz
-
-      # Step 5: Command AWS Systems Manager (SSM) to unpack and trigger reload
+      # Command AWS Systems Manager (SSM) to update code blocks directly
       - name: Execute Deployment Commands via AWS SSM
         run: |
           COMMAND_ID=$(aws ssm send-command \
             --instance-ids "${{ secrets.EC2_INSTANCE_ID }}" \
             --document-name "AWS-RunShellScript" \
-            --comment "Deploying Trivy-vetted build to Employee System" \
+            --comment "Deploying Trivy-vetted build directly to Employee System" \
             --parameters 'commands=[
               "set -e",
               
-              "echo === Step 1: Extract Frontend to Nginx ===",
+              "echo === Step 1: Prepare Directories ===",
               "sudo mkdir -p /var/www/html",
-              "aws s3 cp s3://${{ secrets.AWS_DEPLOY_BUCKET }}/frontend.tar.gz /tmp/frontend.tar.gz",
-              "sudo tar -xzf /tmp/frontend.tar.gz -C /var/www/html/",
-              
-              "echo === Step 2: Extract Backend files ===",
               "sudo mkdir -p /var/www/backend",
-              "aws s3 cp s3://${{ secrets.AWS_DEPLOY_BUCKET }}/backend.tar.gz /tmp/backend.tar.gz",
-              "sudo tar -xzf /tmp/backend.tar.gz -C /var/www/backend/",
               
-              "echo === Step 3: Inject Environment Configurations ===",
+              "echo === Step 2: Inject Environment Configurations ===",
               "echo \"NODE_ENV=production\" | sudo tee /var/www/backend/.env",
               "echo \"DB_HOST=${{ secrets.RDS_ENDPOINT }}\" | sudo tee -a /var/www/backend/.env",
               "echo \"DB_USER=${{ secrets.DB_USER }}\" | sudo tee -a /var/www/backend/.env",
               "echo \"DB_PASS=${{ secrets.DB_PASSWORD }}\" | sudo tee -a /var/www/backend/.env",
               "echo \"JWT_SECRET=${{ secrets.JWT_SECRET }}\" | sudo tee -a /var/www/backend/.env",
               
-              "echo === Step 4: Run Production Install ===",
+              "echo === Step 3: Run Production Install ===",
               "cd /var/www/backend",
               "sudo npm install --production --unsafe-perm",
               
-              "echo === Step 5: Zero-Downtime PM2 Ecosystem Reload ===",
+              "echo === Step 4: Zero-Downtime PM2 Ecosystem Reload ===",
               "sudo pm2 reload ecosystem.config.js --env production || sudo pm2 start ecosystem.config.js --env production",
-              "sudo pm2 save",
-              
-              "echo === Step 6: Purge Local Transit Buffers ===",
-              "rm -f /tmp/frontend.tar.gz /tmp/backend.tar.gz"
+              "sudo pm2 save"
             ]' \
             --query "Command.CommandId" \
             --output text)
