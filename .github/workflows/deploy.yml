@@ -5,7 +5,6 @@ on:
     branches:
       - main
 
-# Opt-in to Node 24 early to avoid the deprecation warning
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
@@ -26,7 +25,7 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: 24 # Using Node 24 natively
+          node-version: 24
           cache: 'npm'
           cache-dependency-path: frontend/package-lock.json
 
@@ -68,7 +67,7 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: 24 # Using Node 24 natively
+          node-version: 24
           cache: 'npm'
           cache-dependency-path: backend/package-lock.json
 
@@ -124,18 +123,22 @@ jobs:
           name: backend-assets
           path: ./dist-backend
 
-      # Package files into normal zip archives (No base64 text hacks!)
+      # Package files into normal zip archives
       - name: Package Code Bundles
         run: |
           tar -czf frontend.tar.gz -C ./dist-frontend .
           tar -czf backend.tar.gz -C ./dist-backend .
 
-      # Dynamically creates a unique private S3 bucket if it doesn't exist, then uploads zip files
+      # Uses the GitHub repository owner name and ID to guarantee global uniqueness
       - name: Sync Bundles to AWS S3
         run: |
-          BUCKET_NAME="ems-deploy-transit-${{ secrets.AWS_ACCOUNT_ID }}"
+          # Converts repository string to lower-case and adds the unique repository ID
+          RAW_NAME="ems-deploy-transit-${{ github.repository_owner }}-${{ github.repository_id }}"
+          BUCKET_NAME=$(echo "$RAW_NAME" | tr '[:upper:]' '[:lower:]')
           
-          # Check if bucket exists, if not, create it securely
+          echo "TARGET_BUCKET=$BUCKET_NAME" >> $GITHUB_ENV
+          
+          # Check if bucket exists, if not, create it cleanly
           if ! aws s3api head-bucket --bucket "$BUCKET_NAME" 2>/dev/null; then
             echo "Creating secure deployment bucket: $BUCKET_NAME"
             aws s3api create-bucket --bucket "$BUCKET_NAME" --region us-east-1
@@ -149,8 +152,6 @@ jobs:
       # Execute Extraction, Configuration, Environment Generation, and Restart Steps entirely over SSM
       - name: Execute Deployment Commands via AWS SSM
         run: |
-          BUCKET_NAME="ems-deploy-transit-${{ secrets.AWS_ACCOUNT_ID }}"
-          
           COMMAND_ID=$(aws ssm send-command \
             --instance-ids "${{ secrets.EC2_INSTANCE_ID }}" \
             --document-name "AWS-RunShellScript" \
@@ -163,11 +164,11 @@ jobs:
               \"sudo rm -rf /var/www/html/*\",
               
               \"echo === Step 2: Download & Extract Frontend from S3 ===\",
-              \"aws s3 cp s3://$BUCKET_NAME/frontend.tar.gz /tmp/frontend.tar.gz\",
+              \"aws s3 cp s3://${{ env.TARGET_BUCKET }}/frontend.tar.gz /tmp/frontend.tar.gz\",
               \"sudo tar -xzf /tmp/frontend.tar.gz -C /var/www/html/\",
               
               \"echo === Step 3: Download & Extract Backend from S3 ===\",
-              \"aws s3 cp s3://$BUCKET_NAME/backend.tar.gz /tmp/backend.tar.gz\",
+              \"aws s3 cp s3://${{ env.TARGET_BUCKET }}/backend.tar.gz /tmp/backend.tar.gz\",
               \"sudo tar -xzf /tmp/backend.tar.gz -C /var/www/backend/\",
               
               \"echo === Step 4: Inject Environment Configurations ===\",
