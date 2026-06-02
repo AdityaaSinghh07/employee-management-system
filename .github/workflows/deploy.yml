@@ -20,14 +20,14 @@ jobs:
       - name: Configure AWS credentials (OIDC)
         uses: aws-actions/configure-aws-credentials@v4
         with:
-          role-to-assume: arn:aws:iam::<ACCOUNT_ID>:role/<OIDC_ROLE>
+          role-to-assume: arn:aws:iam::585853585762:role/GithubActionOIDC
           aws-region: us-east-1
 
       - name: Deploy via SSM
         run: |
           aws ssm send-command \
             --document-name "AWS-RunShellScript" \
-            --targets "Key=instanceIds,Values=<EC2_INSTANCE_ID>" \
+            --targets "Key=instanceIds,Values=i-0b65904c2387ce6cf" \
             --parameters 'commands=[
               "cd /home/ubuntu/employee-management-system",
               "git pull origin main",
