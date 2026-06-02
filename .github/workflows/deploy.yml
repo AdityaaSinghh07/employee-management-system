@@ -98,12 +98,12 @@ jobs:
   # =============================================================
   deploy:
     runs-on: ubuntu-latest
-    needs: [build-frontend, build-backend]
+    needs: [build-frontend, build-backend] # Runs ONLY if frontend and backend pass scans
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v4
 
-      # Secure AWS OIDC Handshake
+      # Secure AWS OIDC Cryptographic Handshake
       - name: Configure AWS Credentials via OIDC
         uses: aws-actions/configure-aws-credentials@v4
         with:
@@ -124,14 +124,14 @@ jobs:
           name: backend-assets
           path: ./dist-backend
 
-      # SECURELY TRANSFER FILES TO EC2 OVER SSM (No S3, No Port 22!)
+      # SECURELY TRANSFER FILES TO UBUNTU HOME CODESPACE OVER SSM
       - name: Transfer Frontend files via SSM
         uses: ncruces/actions-ssm-transfer@v1
         with:
           instance-id: ${{ secrets.EC2_INSTANCE_ID }}
           action: upload
           local-path: ./dist-frontend/
-          remote-path: /var/www/html/
+          remote-path: /home/ubuntu/frontend/
 
       - name: Transfer Backend files via SSM
         uses: ncruces/actions-ssm-transfer@v1
@@ -139,9 +139,9 @@ jobs:
           instance-id: ${{ secrets.EC2_INSTANCE_ID }}
           action: upload
           local-path: ./dist-backend/
-          remote-path: /var/www/backend/
+          remote-path: /home/ubuntu/backend/
 
-      # Execute Configuration and Restart Steps
+      # Execute Configuration and Moving Steps safely on the instance
       - name: Execute Deployment Commands via AWS SSM
         run: |
           COMMAND_ID=$(aws ssm send-command \
@@ -151,18 +151,24 @@ jobs:
             --parameters 'commands=[
               "set -e",
               
-              "echo === Step 1: Inject Environment Configurations ===",
+              "echo === Step 1: Copy Staged Bundles to Production Paths ===",
+              "sudo mkdir -p /var/www/html",
+              "sudo mkdir -p /var/www/backend",
+              "sudo cp -r /home/ubuntu/frontend/* /var/www/html/",
+              "sudo cp -r /home/ubuntu/backend/* /var/www/backend/",
+              
+              "echo === Step 2: Inject Environment Configurations ===",
               "echo \"NODE_ENV=production\" | sudo tee /var/www/backend/.env",
               "echo \"DB_HOST=${{ secrets.RDS_ENDPOINT }}\" | sudo tee -a /var/www/backend/.env",
               "echo \"DB_USER=${{ secrets.DB_USER }}\" | sudo tee -a /var/www/backend/.env",
               "echo \"DB_PASS=${{ secrets.DB_PASSWORD }}\" | sudo tee -a /var/www/backend/.env",
               "echo \"JWT_SECRET=${{ secrets.JWT_SECRET }}\" | sudo tee -a /var/www/backend/.env",
               
-              "echo === Step 2: Run Production Install ===",
+              "echo === Step 3: Run Production Install ===",
               "cd /var/www/backend",
               "sudo npm install --production --unsafe-perm",
               
-              "echo === Step 3: Zero-Downtime PM2 Ecosystem Reload ===",
+              "echo === Step 4: Zero-Downtime PM2 Ecosystem Reload ===",
               "sudo pm2 reload ecosystem.config.js --env production || sudo pm2 start ecosystem.config.js --env production",
               "sudo pm2 save"
             ]' \
