@@ -5,6 +5,10 @@ on:
     branches:
       - main
 
+# Opt-in to Node 24 early to avoid the deprecation warning
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
 permissions:
   id-token: write
   contents: read
@@ -22,7 +26,7 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: 24 # Using Node 24 natively
           cache: 'npm'
           cache-dependency-path: frontend/package-lock.json
 
@@ -64,7 +68,7 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: 24 # Using Node 24 natively
           cache: 'npm'
           cache-dependency-path: backend/package-lock.json
 
@@ -83,7 +87,6 @@ jobs:
           ignore-unfixed: true
           severity: 'HIGH,CRITICAL'
 
-      # Upload the backend folder as an artifact
       - name: Upload Backend Artifact
         uses: actions/upload-artifact@v4
         with:
@@ -91,7 +94,7 @@ jobs:
           path: backend/
 
   # =============================================================
-  # JOB 3: Secure AWS Deployment via SSM
+  # JOB 3: Secure AWS Deployment via S3 Transit Bridge & SSM
   # =============================================================
   deploy:
     runs-on: ubuntu-latest
@@ -121,57 +124,70 @@ jobs:
           name: backend-assets
           path: ./dist-backend
 
-      # Package the builds into localized compressed bundles and encode them to text string format
-      - name: Convert Build Bundles to Inline Text Strings
-        id: encoder
+      # Package files into normal zip archives (No base64 text hacks!)
+      - name: Package Code Bundles
         run: |
           tar -czf frontend.tar.gz -C ./dist-frontend .
           tar -czf backend.tar.gz -C ./dist-backend .
+
+      # Dynamically creates a unique private S3 bucket if it doesn't exist, then uploads zip files
+      - name: Sync Bundles to AWS S3
+        run: |
+          BUCKET_NAME="ems-deploy-transit-${{ secrets.AWS_ACCOUNT_ID }}"
           
-          # Convert archives to single-line base64 strings and save them to GitHub runner env profiles
-          echo "FRONTEND_B64=$(base64 -w 0 frontend.tar.gz)" >> $GITHUB_ENV
-          echo "BACKEND_B64=$(base64 -w 0 backend.tar.gz)" >> $GITHUB_ENV
+          # Check if bucket exists, if not, create it securely
+          if ! aws s3api head-bucket --bucket "$BUCKET_NAME" 2>/dev/null; then
+            echo "Creating secure deployment bucket: $BUCKET_NAME"
+            aws s3api create-bucket --bucket "$BUCKET_NAME" --region us-east-1
+            aws s3api put-bucket-encryption --bucket "$BUCKET_NAME" --server-side-encryption-configuration '{"Rules": [{"ApplyServerSideEncryptionByDefault": {"SSEAlgorithm": "AES256"}}]}'
+          fi
+          
+          # Push archives to S3
+          aws s3 cp frontend.tar.gz "s3://$BUCKET_NAME/frontend.tar.gz"
+          aws s3 cp backend.tar.gz "s3://$BUCKET_NAME/backend.tar.gz"
 
       # Execute Extraction, Configuration, Environment Generation, and Restart Steps entirely over SSM
       - name: Execute Deployment Commands via AWS SSM
         run: |
+          BUCKET_NAME="ems-deploy-transit-${{ secrets.AWS_ACCOUNT_ID }}"
+          
           COMMAND_ID=$(aws ssm send-command \
             --instance-ids "${{ secrets.EC2_INSTANCE_ID }}" \
             --document-name "AWS-RunShellScript" \
-            --comment "Unpacking builds and restarting PM2 apps via secure string injection" \
-            --parameters 'commands=[
-              "set -e",
+            --comment "Pulling deployment bundles from secure S3 transit and reloading PM2" \
+            --parameters "commands=[
+              \"set -e\",
               
-              "echo === Step 1: Clean and Prepare Directory Paths ===",
-              "sudo mkdir -p /var/www/html /var/www/backend",
-              "sudo rm -rf /var/www/html/*",
+              \"echo === Step 1: Clean and Prepare Directory Paths ===\",
+              \"sudo mkdir -p /var/www/html /var/www/backend\",
+              \"sudo rm -rf /var/www/html/*\",
               
-              "echo === Step 2: Unpack Frontend Bundle From Payload ===",
-              "echo \"${{ env.FRONTEND_B64 }}\" | base64 -d > /tmp/frontend.tar.gz",
-              "sudo tar -xzf /tmp/frontend.tar.gz -C /var/www/html/",
+              \"echo === Step 2: Download & Extract Frontend from S3 ===\",
+              \"aws s3 cp s3://$BUCKET_NAME/frontend.tar.gz /tmp/frontend.tar.gz\",
+              \"sudo tar -xzf /tmp/frontend.tar.gz -C /var/www/html/\",
               
-              "echo === Step 3: Unpack Backend Bundle From Payload ===",
-              "echo \"${{ env.BACKEND_B64 }}\" | base64 -d > /tmp/backend.tar.gz",
-              "sudo tar -xzf /tmp/backend.tar.gz -C /var/www/backend/",
+              \"echo === Step 3: Download & Extract Backend from S3 ===\",
+              \"aws s3 cp s3://$BUCKET_NAME/backend.tar.gz /tmp/backend.tar.gz\",
+              \"sudo tar -xzf /tmp/backend.tar.gz -C /var/www/backend/\",
               
-              "echo === Step 4: Inject Environment Configurations ===",
-              "echo \"NODE_ENV=production\" | sudo tee /var/www/backend/.env",
-              "echo \"DB_HOST=${{ secrets.RDS_ENDPOINT }}\" | sudo tee -a /var/www/backend/.env",
-              "echo \"DB_USER=${{ secrets.DB_USER }}\" | sudo tee -a /var/www/backend/.env",
-              "echo \"DB_PASS=${{ secrets.DB_PASSWORD }}\" | sudo tee -a /var/www/backend/.env",
-              "echo \"JWT_SECRET=${{ secrets.JWT_SECRET }}\" | sudo tee -a /var/www/backend/.env",
+              \"echo === Step 4: Inject Environment Configurations ===\",
+              \"echo \\\"NODE_ENV=production\\\" | sudo tee /var/www/backend/.env\",
+              \"echo \\\"DB_HOST=${{ secrets.RDS_ENDPOINT }}\\\" | sudo tee -a /var/www/backend/.env\",
+              \"echo \\\"DB_USER=${{ secrets.DB_USER }}\\\" | sudo tee -a /var/www/backend/.env\",
+              \"echo \\\"DB_PASS=${{ secrets.DB_PASSWORD }}\\\" | sudo tee -a /var/www/backend/.env\",
+              \"echo \\\"JWT_SECRET=${{ secrets.JWT_SECRET }}\\\" | sudo tee -a /var/www/backend/.env\",
               
-              "echo === Step 5: Run Production Install ===",
-              "cd /var/www/backend",
-              "sudo npm install --production --unsafe-perm",
+              \"echo === Step 5: Run Production Install ===\",
+              \"cd /var/www/backend\",
+              \"sudo npm install --production --unsafe-perm\",
               
-              "echo === Step 6: Zero-Downtime PM2 Ecosystem Reload ===",
-              "sudo pm2 reload ecosystem.config.js --env production || sudo pm2 start ecosystem.config.js --env production",
-              "sudo pm2 save",
+              \"echo === Step 6: Zero-Downtime PM2 Ecosystem Reload ===\",
+              \"sudo pm2 reload ecosystem.config.js --env production || sudo pm2 start ecosystem.config.js --env production\",
+              \"sudo pm2 save\",
               
-              "echo === Step 7: Cleanup Temp Archives ===",
-              "rm -f /tmp/frontend.tar.gz /tmp/backend.tar.gz"
-            ]' \
+              \"echo === Step 7: Cleanup Temp Archives ===\",
+              \"rm -f /tmp/frontend.tar.gz /tmp/backend.tar.gz\"
+            ]" \
             --query "Command.CommandId" \
             --output text)
           
