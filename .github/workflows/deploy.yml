@@ -3,11 +3,11 @@ name: Secure Employee Management System Deployment
 on:
   push:
     branches:
-      - main # Triggers when you push from your DevOps workstation to GitHub main branch
+      - main
 
 permissions:
-  id-token: write # Mandatory for requesting the dynamic AWS OIDC JWT token
-  contents: read  # Mandatory to checkout the codebase
+  id-token: write
+  contents: read
 
 jobs:
   # =============================================================
@@ -31,18 +31,16 @@ jobs:
           cd frontend
           npm ci
 
-      # Scans frontend dependencies before execution
       - name: Security Scan Frontend Code (Trivy)
         uses: aquasecurity/trivy-action@v0.36.0
         with:
           scan-type: 'fs'
           scan-ref: './frontend'
           format: 'table'
-          exit-code: '1' # Breaks pipeline if matching vulnerabilities are discovered
-          ignore-unfixed: true # Prevents breaking on bugs without a public patch
+          exit-code: '1'
+          ignore-unfixed: true
           severity: 'HIGH,CRITICAL'
 
-      # Compiles into production static files only if scanning succeeds
       - name: Build Vite Production Bundles
         run: |
           cd frontend
@@ -75,7 +73,6 @@ jobs:
           cd backend
           npm ci
 
-      # Scans backend Node modules for CVEs
       - name: Security Scan Backend Code (Trivy)
         uses: aquasecurity/trivy-action@v0.36.0
         with:
@@ -98,20 +95,20 @@ jobs:
   # =============================================================
   deploy:
     runs-on: ubuntu-latest
-    needs: [build-frontend, build-backend] # Runs ONLY if frontend and backend pass scans
+    needs: [build-frontend, build-backend]
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v4
 
-      # Secure AWS OIDC Cryptographic Handshake
+      # Secure AWS OIDC Handshake
       - name: Configure AWS Credentials via OIDC
         uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
-          aws-region: us-east-1 # Match your target infrastructure region
+          aws-region: us-east-1
           audience: sts.amazonaws.com
 
-      # Download verified, compiled packages from parallel workers
+      # Download built artifacts from previous stages
       - name: Download Frontend Artifacts
         uses: actions/download-artifact@v4
         with:
@@ -124,53 +121,56 @@ jobs:
           name: backend-assets
           path: ./dist-backend
 
-      # SECURELY TRANSFER FILES TO UBUNTU HOME CODESPACE OVER SSM
-      - name: Transfer Frontend files via SSM
-        uses: ncruces/actions-ssm-transfer@v1
-        with:
-          instance-id: ${{ secrets.EC2_INSTANCE_ID }}
-          action: upload
-          local-path: ./dist-frontend/
-          remote-path: /home/ubuntu/frontend/
+      # Package the builds into localized compressed bundles and encode them to text string format
+      - name: Convert Build Bundles to Inline Text Strings
+        id: encoder
+        run: |
+          tar -czf frontend.tar.gz -C ./dist-frontend .
+          tar -czf backend.tar.gz -C ./dist-backend .
+          
+          # Convert archives to single-line base64 strings and save them to GitHub runner env profiles
+          echo "FRONTEND_B64=$(base64 -w 0 frontend.tar.gz)" >> $GITHUB_ENV
+          echo "BACKEND_B64=$(base64 -w 0 backend.tar.gz)" >> $GITHUB_ENV
 
-      - name: Transfer Backend files via SSM
-        uses: ncruces/actions-ssm-transfer@v1
-        with:
-          instance-id: ${{ secrets.EC2_INSTANCE_ID }}
-          action: upload
-          local-path: ./dist-backend/
-          remote-path: /home/ubuntu/backend/
-
-      # Execute Configuration and Moving Steps safely on the instance
+      # Execute Extraction, Configuration, Environment Generation, and Restart Steps entirely over SSM
       - name: Execute Deployment Commands via AWS SSM
         run: |
           COMMAND_ID=$(aws ssm send-command \
             --instance-ids "${{ secrets.EC2_INSTANCE_ID }}" \
             --document-name "AWS-RunShellScript" \
-            --comment "Configuring and restarting Employee System" \
+            --comment "Unpacking builds and restarting PM2 apps via secure string injection" \
             --parameters 'commands=[
               "set -e",
               
-              "echo === Step 1: Copy Staged Bundles to Production Paths ===",
-              "sudo mkdir -p /var/www/html",
-              "sudo mkdir -p /var/www/backend",
-              "sudo cp -r /home/ubuntu/frontend/* /var/www/html/",
-              "sudo cp -r /home/ubuntu/backend/* /var/www/backend/",
+              "echo === Step 1: Clean and Prepare Directory Paths ===",
+              "sudo mkdir -p /var/www/html /var/www/backend",
+              "sudo rm -rf /var/www/html/*",
               
-              "echo === Step 2: Inject Environment Configurations ===",
+              "echo === Step 2: Unpack Frontend Bundle From Payload ===",
+              "echo \"${{ env.FRONTEND_B64 }}\" | base64 -d > /tmp/frontend.tar.gz",
+              "sudo tar -xzf /tmp/frontend.tar.gz -C /var/www/html/",
+              
+              "echo === Step 3: Unpack Backend Bundle From Payload ===",
+              "echo \"${{ env.BACKEND_B64 }}\" | base64 -d > /tmp/backend.tar.gz",
+              "sudo tar -xzf /tmp/backend.tar.gz -C /var/www/backend/",
+              
+              "echo === Step 4: Inject Environment Configurations ===",
               "echo \"NODE_ENV=production\" | sudo tee /var/www/backend/.env",
               "echo \"DB_HOST=${{ secrets.RDS_ENDPOINT }}\" | sudo tee -a /var/www/backend/.env",
               "echo \"DB_USER=${{ secrets.DB_USER }}\" | sudo tee -a /var/www/backend/.env",
               "echo \"DB_PASS=${{ secrets.DB_PASSWORD }}\" | sudo tee -a /var/www/backend/.env",
               "echo \"JWT_SECRET=${{ secrets.JWT_SECRET }}\" | sudo tee -a /var/www/backend/.env",
               
-              "echo === Step 3: Run Production Install ===",
+              "echo === Step 5: Run Production Install ===",
               "cd /var/www/backend",
               "sudo npm install --production --unsafe-perm",
               
-              "echo === Step 4: Zero-Downtime PM2 Ecosystem Reload ===",
+              "echo === Step 6: Zero-Downtime PM2 Ecosystem Reload ===",
               "sudo pm2 reload ecosystem.config.js --env production || sudo pm2 start ecosystem.config.js --env production",
-              "sudo pm2 save"
+              "sudo pm2 save",
+              
+              "echo === Step 7: Cleanup Temp Archives ===",
+              "rm -f /tmp/frontend.tar.gz /tmp/backend.tar.gz"
             ]' \
             --query "Command.CommandId" \
             --output text)
