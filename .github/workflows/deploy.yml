@@ -98,12 +98,12 @@ jobs:
   # =============================================================
   deploy:
     runs-on: ubuntu-latest
-    needs: [build-frontend, build-backend] # Runs ONLY if frontend and backend pass scans
+    needs: [build-frontend, build-backend]
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v4
 
-      # Secure AWS OIDC Cryptographic Handshake
+      # Secure AWS OIDC Handshake
       - name: Configure AWS Credentials via OIDC
         uses: aws-actions/configure-aws-credentials@v4
         with:
@@ -124,39 +124,50 @@ jobs:
           name: backend-assets
           path: ./dist-backend
 
-      # Command AWS Systems Manager (SSM) to update code blocks directly
+      # SECURELY TRANSFER FILES TO EC2 OVER SSM (No S3, No Port 22!)
+      - name: Transfer Frontend files via SSM
+        uses: ncruces/actions-ssm-transfer@v1
+        with:
+          instance-id: ${{ secrets.EC2_INSTANCE_ID }}
+          action: upload
+          local-path: ./dist-frontend/
+          remote-path: /var/www/html/
+
+      - name: Transfer Backend files via SSM
+        uses: ncruces/actions-ssm-transfer@v1
+        with:
+          instance-id: ${{ secrets.EC2_INSTANCE_ID }}
+          action: upload
+          local-path: ./dist-backend/
+          remote-path: /var/www/backend/
+
+      # Execute Configuration and Restart Steps
       - name: Execute Deployment Commands via AWS SSM
         run: |
           COMMAND_ID=$(aws ssm send-command \
             --instance-ids "${{ secrets.EC2_INSTANCE_ID }}" \
             --document-name "AWS-RunShellScript" \
-            --comment "Deploying Trivy-vetted build directly to Employee System" \
+            --comment "Configuring and restarting Employee System" \
             --parameters 'commands=[
               "set -e",
               
-              "echo === Step 1: Prepare Directories ===",
-              "sudo mkdir -p /var/www/html",
-              "sudo mkdir -p /var/www/backend",
-              
-              "echo === Step 2: Inject Environment Configurations ===",
+              "echo === Step 1: Inject Environment Configurations ===",
               "echo \"NODE_ENV=production\" | sudo tee /var/www/backend/.env",
               "echo \"DB_HOST=${{ secrets.RDS_ENDPOINT }}\" | sudo tee -a /var/www/backend/.env",
               "echo \"DB_USER=${{ secrets.DB_USER }}\" | sudo tee -a /var/www/backend/.env",
               "echo \"DB_PASS=${{ secrets.DB_PASSWORD }}\" | sudo tee -a /var/www/backend/.env",
               "echo \"JWT_SECRET=${{ secrets.JWT_SECRET }}\" | sudo tee -a /var/www/backend/.env",
               
-              "echo === Step 3: Run Production Install ===",
+              "echo === Step 2: Run Production Install ===",
               "cd /var/www/backend",
               "sudo npm install --production --unsafe-perm",
               
-              "echo === Step 4: Zero-Downtime PM2 Ecosystem Reload ===",
+              "echo === Step 3: Zero-Downtime PM2 Ecosystem Reload ===",
               "sudo pm2 reload ecosystem.config.js --env production || sudo pm2 start ecosystem.config.js --env production",
               "sudo pm2 save"
             ]' \
             --query "Command.CommandId" \
             --output text)
           
-          echo "SSM Deployment sequence initialized. Tracking Command ID: $COMMAND_ID"
-          
-          # Keeps the GitHub pipeline running until the script finishes execution on the server
+          echo "SSM Execution sequence initialized. Tracking Command ID: $COMMAND_ID"
           aws ssm wait command-executed --command-id "$COMMAND_ID" --instance-id "${{ secrets.EC2_INSTANCE_ID }}"
