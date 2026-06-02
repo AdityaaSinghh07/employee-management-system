@@ -1,0 +1,33 @@
+name: Deploy Backend to EC2
+
+on:
+  push:
+    branches:
+      - main
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::585853585762:role/GithubActionOIDC
+          aws-region: us-east-1
+
+      - name: Deploy to EC2 via SSH
+        run: |
+          ssh -o StrictHostKeyChecking=no ubuntu@3.82.99.19 << 'EOF'
+            cd ~/employee-management-system/backend
+            git pull origin main
+            npm install
+            pm2 restart backend
+          EOF
